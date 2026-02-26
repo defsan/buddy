@@ -1,12 +1,12 @@
 # BUILDSPEC — Week 3: Home Device + Wake Word Detection
 
 > **Audience:** AI coding agent (Claude Code, Cursor, Copilot, etc.)
-> **Prerequisite:** Week 2 complete — Pipecat voice pipeline with OpenClaw integration and PWA client working.
+> **Prerequisite:** Week 2 complete — Pipecat voice pipeline with OpenClaw integration and PWA client working. Local-first STT (whisper.cpp) and TTS (Piper) in place.
 > **Do not skip steps.** Each phase builds on the previous one. Verify each phase works before moving to the next.
 > **Repo:** `git@github.com:defsan/buddy.git`
 > **Working directory:** `/Users/elie/.openclaw/workspace/projects/buddy`
 > **Host machine:** Mac Mini M4 (16GB), macOS, Python 3.12+, `uv` package manager
-> **Secondary machine:** Mac Studio Ultra M4 (128GB) at `192.168.68.99` — Ollama host
+> **Secondary machine:** Mac Studio Ultra M4 (128GB) at `192.168.68.99` — runs Ollama + whisper.cpp server
 
 ---
 
@@ -21,6 +21,8 @@ Add always-on "Hey Buddy" wake word and turn an iPad into a dedicated home compa
 5. UX polish: audio feedback chimes, tool-use indicators, conversation flow improvements
 6. Security: LAN-only, no key exposure, optional Tailscale for remote
 
+**All STT and TTS remain local** — whisper.cpp on Mac Studio, Piper on Mac Mini. No change to the audio processing stack.
+
 **Success metric:** iPad on a stand, always on. Say "Hey Buddy, what's on my calendar?" from across the room — hear a real answer within 2.5 seconds. Open iPhone PWA mid-conversation → iPad yields automatically.
 
 ---
@@ -32,6 +34,8 @@ projects/buddy/
 ├── server/
 │   ├── bot.py                  # Updated: conversation end detection, data channel events
 │   ├── openclaw_llm.py         # Updated: tool-use event forwarding
+│   ├── stt_whisper.py          # Unchanged — whisper.cpp batch STT
+│   ├── tts_piper.py            # Unchanged — Piper local TTS
 │   ├── device_manager.py       # NEW: multi-device session management
 │   ├── config.py               # Updated: add Picovoice, VAD tuning, debug settings
 │   ├── pyproject.toml          # Unchanged from Week 2
@@ -84,6 +88,12 @@ These cannot be automated. The coding agent should check for them and print clea
 ### 0.3 iPad
 
 Any iPad running iPadOS 15+ with Safari. Doesn't need to be new — an old iPad on a cheap stand works fine.
+
+### 0.4 Verify Local Services (from Week 1)
+
+Ensure these are still running:
+- [ ] whisper.cpp server on Mac Studio: `curl http://192.168.68.99:8178/`
+- [ ] Piper binary on Mac Mini: `~/.local/share/piper/piper/piper --help`
 
 ---
 
@@ -150,10 +160,6 @@ class WakeWordDetector {
         return false;
       }
 
-      // Initialize Porcupine
-      // The exact API depends on the Porcupine Web SDK version.
-      // v3.x uses PorcupineWorker.create() or Porcupine.create()
-      // Check the global namespace after loading the CDN script.
       const PorcupineModule = window.Porcupine || window.PorcupineWorker;
       if (!PorcupineModule) {
         console.error('Porcupine SDK not loaded');
@@ -168,7 +174,6 @@ class WakeWordDetector {
         }]
       );
 
-      // Get microphone stream
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -177,12 +182,9 @@ class WakeWordDetector {
         }
       });
 
-      // Create audio processing pipeline
       this.audioContext = new AudioContext({ sampleRate: this.porcupine.sampleRate || 16000 });
       const source = this.audioContext.createMediaStreamSource(this.mediaStream);
 
-      // Process audio frames through Porcupine
-      // Porcupine expects 512-sample frames at 16kHz
       const frameLength = this.porcupine.frameLength || 512;
       this.processorNode = this.audioContext.createScriptProcessor(frameLength, 1, 1);
 
@@ -192,19 +194,16 @@ class WakeWordDetector {
         if (this.isPaused) return;
 
         const inputData = event.inputBuffer.getChannelData(0);
-        // Convert Float32 to Int16
         const int16 = new Int16Array(inputData.length);
         for (let i = 0; i < inputData.length; i++) {
           int16[i] = Math.max(-32768, Math.min(32767, Math.round(inputData[i] * 32768)));
         }
 
-        // Accumulate buffer
         const newBuffer = new Int16Array(buffer.length + int16.length);
         newBuffer.set(buffer);
         newBuffer.set(int16, buffer.length);
         buffer = newBuffer;
 
-        // Process complete frames
         while (buffer.length >= frameLength) {
           const frame = buffer.slice(0, frameLength);
           buffer = buffer.slice(frameLength);
@@ -263,16 +262,9 @@ class WakeWordDetector {
 
 **Implementation notes:**
 
-1. The Porcupine Web SDK API varies by version. Check the actual installed/loaded version's API. Common patterns:
-   - v2.x: `Porcupine.create(accessKey, keywords, detectionCallback)`
-   - v3.x: `PorcupineWorker.create(accessKey, keywords)` then `porcupine.process(frame)` returns keyword index
-   - Some versions use a Worker-based approach where detection fires via callback
-
+1. The Porcupine Web SDK API varies by version. Check the actual installed/loaded version's API.
 2. `ScriptProcessorNode` is deprecated but universally supported. For production, migrate to `AudioWorkletNode`. For v1, ScriptProcessorNode is fine.
-
-3. The mic stream obtained here is separate from the WebRTC mic stream used during conversation. When wake word triggers → pause wake word → start WebRTC conversation → on conversation end → stop WebRTC → resume wake word. Do NOT share the same stream.
-
-4. If the Picovoice Access Key is missing, the constructor will throw. Handle this gracefully — fall back to push-to-talk.
+3. The mic stream obtained here is separate from the WebRTC mic stream used during conversation. When wake word triggers → pause wake word → start WebRTC conversation → on conversation end → stop WebRTC → resume wake word.
 
 ### 1.3 Create `client/web/sounds.js`
 
@@ -281,9 +273,7 @@ Procedural audio feedback using Web Audio API. No external audio files needed.
 ```javascript
 /**
  * Procedural audio feedback sounds.
- *
- * All sounds are generated via Web Audio API — no files to load.
- * Keep sounds short and subtle. These are UI feedback, not music.
+ * All sounds generated via Web Audio API — no files to load.
  */
 
 class SoundEffects {
@@ -307,10 +297,7 @@ class SoundEffects {
     if (!this.enabled) return;
     const ctx = this._ensureContext();
     const now = ctx.currentTime;
-
-    // First tone
     this._tone(ctx, 660, 0.08, now, 0.08);
-    // Second tone (higher)
     this._tone(ctx, 880, 0.08, now + 0.1, 0.12);
   }
 
@@ -342,8 +329,7 @@ class SoundEffects {
   error() {
     if (!this.enabled) return;
     const ctx = this._ensureContext();
-    const now = ctx.currentTime;
-    this._tone(ctx, 220, 0.05, now, 0.25);
+    this._tone(ctx, 220, 0.05, ctx.currentTime, 0.25);
   }
 
   /** Subtle tick — tool executing */
@@ -393,7 +379,6 @@ class AlwaysOnManager {
     this.clockInterval = null;
   }
 
-  /** Enable all always-on features */
   async enable() {
     this._enableAutoReconnect();
     await this._enableWakeLock();
@@ -408,21 +393,15 @@ class AlwaysOnManager {
     if (this.idleTimer) clearTimeout(this.idleTimer);
   }
 
-  /** Call this when voice activity is detected (wakes from ambient) */
   onActivity() {
     this._resetIdleTimer();
   }
 
-  // ── Auto-Reconnect ──────────────────────────────────────
-
   _enableAutoReconnect() {
-    // Hook into client disconnect events
     const originalDisconnect = this.client._onDisconnected?.bind(this.client);
 
     this.client._onDisconnected = async () => {
       if (originalDisconnect) originalDisconnect();
-
-      // Don't auto-reconnect if user manually disconnected
       if (this.client._userDisconnected) return;
 
       console.log(`🔄 Reconnecting in ${this.reconnectDelay}ms...`);
@@ -431,15 +410,12 @@ class AlwaysOnManager {
 
       try {
         await this.client._connect();
-        this.reconnectDelay = 1000; // Reset on success
+        this.reconnectDelay = 1000;
       } catch (e) {
         console.warn('Reconnect failed, retrying...');
-        // Will trigger _onDisconnected again → retry loop
       }
     };
   }
-
-  // ── Wake Lock ───────────────────────────────────────────
 
   async _enableWakeLock() {
     if (!('wakeLock' in navigator)) {
@@ -451,7 +427,6 @@ class AlwaysOnManager {
       this.wakeLock = await navigator.wakeLock.request('screen');
       console.log('🔒 Screen wake lock acquired');
 
-      // Re-acquire on visibility change (Safari releases it when tab is backgrounded)
       document.addEventListener('visibilitychange', async () => {
         if (document.visibilityState === 'visible' && !this.wakeLock) {
           try {
@@ -474,8 +449,6 @@ class AlwaysOnManager {
       this.wakeLock = null;
     }
   }
-
-  // ── Ambient Mode ────────────────────────────────────────
 
   _enableAmbientMode() {
     const events = ['touchstart', 'mousemove', 'keydown', 'click'];
@@ -500,8 +473,6 @@ class AlwaysOnManager {
     document.body.classList.remove('ambient');
     console.log('👀 Waking from ambient mode');
   }
-
-  // ── Clock ───────────────────────────────────────────────
 
   _startClock() {
     const clockEl = document.getElementById('ambientClock');
@@ -586,7 +557,6 @@ this.conversationTimeoutMs = 30_000; // 30s silence → end conversation
 
 // New method: initialize always-on mode (call after first user interaction)
 async enableAlwaysOn(picovoiceAccessKey) {
-  // Start wake word
   if (picovoiceAccessKey) {
     this.wakeWord = new WakeWordDetector(picovoiceAccessKey, () => {
       this.sounds.wakeWordAck();
@@ -598,52 +568,42 @@ async enableAlwaysOn(picovoiceAccessKey) {
     }
   }
 
-  // Start always-on manager
   this.alwaysOn = new AlwaysOnManager(this);
   await this.alwaysOn.enable();
 }
 
-// Wake word triggered
 async _onWakeWord() {
   if (this.wakeWord) this.wakeWord.pause();
   await this._connect();
 }
 
-// Override _connect to set up data channel
-// After RTCPeerConnection is created, add:
+// Override _connect to set up data channel:
 this.dataChannel = this.pc.createDataChannel('control');
 this.dataChannel.onmessage = (event) => {
   const msg = JSON.parse(event.data);
   this._handleServerMessage(msg);
 };
 
-// Handle server-side control messages
 _handleServerMessage(msg) {
   switch (msg.type) {
     case 'state':
-      // Server indicates pipeline state
       if (msg.state === 'listening') this._setState(STATE.LISTENING);
       if (msg.state === 'thinking') this._setState(STATE.THINKING);
       if (msg.state === 'speaking') this._setState(STATE.SPEAKING);
       break;
     case 'tool_use':
-      // Show tool indicator
       this._showToolIndicator(msg.tool, msg.status);
       break;
     case 'conversation_end':
-      // Server says conversation is over
       this._endConversation();
       break;
     case 'yield':
-      // Another device connected — yield gracefully
       this._endConversation('Another device is active');
       break;
   }
-  // Any server message counts as activity
   if (this.alwaysOn) this.alwaysOn.onActivity();
 }
 
-// End conversation and return to wake word listening
 _endConversation(reason) {
   if (this.conversationTimeout) clearTimeout(this.conversationTimeout);
   this._disconnect();
@@ -663,7 +623,6 @@ _endConversation(reason) {
   }
 }
 
-// Tool indicator
 _showToolIndicator(tool, status) {
   const el = document.getElementById('toolIndicator');
   if (!el) return;
@@ -678,13 +637,9 @@ _showToolIndicator(tool, status) {
   }
 }
 
-// Update _setState for new states
-// Add to the state→orb class map:
-//   [STATE.WAKE_LISTENING]: 'idle',
-// Add to the state→status text map:
-//   [STATE.WAKE_LISTENING]: 'say "Hey Buddy"',
-// Add to the button logic:
-//   if WAKE_LISTENING: button says "Push to Talk" (manual override)
+// Update _setState for new states:
+//   [STATE.WAKE_LISTENING]: orb class 'idle', status 'say "Hey Buddy"'
+//   Button text: "Push to Talk" when in WAKE_LISTENING
 ```
 
 **IMPORTANT:** These are modifications to the existing `app.js` from Week 2. Do NOT rewrite the file from scratch — merge these additions into the existing WebRTC connection logic. Keep all existing functionality working.
@@ -758,13 +713,13 @@ BUDDY_DEBUG_TRANSCRIPTS=false
 ### 1.9 Verify wake word
 
 1. Ensure `models/hey-buddy_en_wasm.ppn` exists in `client/web/models/`
-2. Ensure `PICOVOICE_ACCESS_KEY` is set in `.env` (and exposed to client — see note below)
+2. Ensure `PICOVOICE_ACCESS_KEY` is set (exposed to client via config.js — see note below)
 3. Open browser client
 4. Say "Hey Buddy" — should hear chime, then connect to server
 
 **Access key delivery to client:** The Picovoice Access Key needs to be available client-side. Options:
 - **Option A:** Hardcode in a `client/web/config.js` file (gitignored). Simple, fine for LAN-only.
-- **Option B:** Serve it from a `/api/config` endpoint on the server. Slightly more secure.
+- **Option B:** Serve it from a `/api/config` endpoint on the server.
 - **Recommended:** Option A for v1. Create `client/web/config.js`:
   ```javascript
   const BUDDY_CONFIG = {
@@ -785,18 +740,17 @@ BUDDY_DEBUG_TRANSCRIPTS=false
 """Multi-device session manager.
 
 Ensures only one device is active at a time. When a new device connects,
-the previous device is asked to yield. Tracks device metadata for
-debugging and logging.
+the previous device is asked to yield. Tracks device metadata.
 
 Rules:
 1. If no device is active → new device connects immediately
 2. If iPad is idle (wake word listening) and iPhone connects → iPad yields
-3. If any device is mid-conversation → new device waits (or pre-empts based on priority)
+3. If any device is mid-conversation → new device waits or pre-empts based on priority
 4. Manual "Connect" button always takes priority
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Awaitable
 
@@ -804,9 +758,9 @@ from loguru import logger
 
 
 class DeviceType(str, Enum):
-    IPAD = "ipad"       # Home station — lowest priority, resumes wake word on yield
-    IPHONE = "iphone"   # Mobile — medium priority
-    MAC = "mac"         # Desktop — medium priority
+    IPAD = "ipad"
+    IPHONE = "iphone"
+    MAC = "mac"
     UNKNOWN = "unknown"
 
 
@@ -827,11 +781,6 @@ class DeviceManager:
         self._yield_callback: Callable[[str], Awaitable[None]] | None = None
 
     def set_yield_callback(self, callback: Callable[[str], Awaitable[None]]):
-        """Set callback to send 'yield' signal to a device.
-        
-        callback(device_id) should send a WebRTC data channel message
-        to the specified device telling it to disconnect.
-        """
         self._yield_callback = callback
 
     @property
@@ -839,10 +788,6 @@ class DeviceManager:
         return self._active.device_id if self._active else None
 
     async def connect(self, device_id: str, device_type: str = "unknown", user_agent: str = "") -> bool:
-        """Register a new device connection. Returns True if allowed.
-        
-        If another device is active, sends it a yield signal first.
-        """
         dtype = DeviceType(device_type) if device_type in DeviceType.__members__.values() else DeviceType.UNKNOWN
 
         info = DeviceInfo(
@@ -854,7 +799,6 @@ class DeviceManager:
         )
         self._devices[device_id] = info
 
-        # Yield previous device if needed
         if self._active and self._active.device_id != device_id:
             old_id = self._active.device_id
             logger.info(f"📱 Device {device_id} ({dtype}) taking over from {old_id}")
@@ -867,43 +811,41 @@ class DeviceManager:
         return True
 
     def disconnect(self, device_id: str):
-        """Remove a device connection."""
         if self._active and self._active.device_id == device_id:
             logger.info(f"📱 Device {device_id} disconnected")
             self._active = None
         self._devices.pop(device_id, None)
 
     def mark_active(self, device_id: str):
-        """Mark a device as actively in conversation (prevents yield)."""
         if device_id in self._devices:
             self._devices[device_id].last_active = time.time()
             self._devices[device_id].in_conversation = True
 
     def mark_idle(self, device_id: str):
-        """Mark a device as idle (can be yielded)."""
         if device_id in self._devices:
             self._devices[device_id].in_conversation = False
 ```
 
 ### 2.2 Update `server/bot.py` — Add Device Management + Data Channel
 
-Add device manager integration and WebRTC data channel support to the existing bot.
+Add device manager integration and WebRTC data channel support.
 
 Key changes:
-1. Accept `device_id` from client during WebRTC signaling (pass as query param or in offer)
+1. Accept `device_id` from client during WebRTC signaling
 2. Create data channel for control messages (yield, state, tool_use, conversation_end)
 3. On `on_client_connected`: register device with manager
 4. On `on_client_disconnected`: unregister device
-5. Conversation end detection: if 30s of silence → send `conversation_end` via data channel
+5. Conversation end detection: 30s silence → send `conversation_end` via data channel
 
 ```python
 # Add to bot.py:
 
+import time
 from device_manager import DeviceManager
+from pipecat.processors.frame_processor import FrameProcessor
 
 device_mgr = DeviceManager()
 
-# Conversation end detection — add as a custom frame processor
 class ConversationEndDetector(FrameProcessor):
     """Detects prolonged silence and signals conversation end."""
 
@@ -911,32 +853,25 @@ class ConversationEndDetector(FrameProcessor):
         super().__init__()
         self.timeout = timeout_seconds
         self.last_activity = time.time()
-        self._task = None
 
     async def process_frame(self, frame, direction):
         from pipecat.frames.frames import TranscriptionFrame, TextFrame
 
-        # Any transcription or bot response resets the timer
         if isinstance(frame, (TranscriptionFrame, TextFrame)):
             self.last_activity = time.time()
 
         await self.push_frame(frame, direction)
 
     async def check_timeout(self) -> bool:
-        """Returns True if conversation has timed out."""
         return (time.time() - self.last_activity) > self.timeout
 ```
 
 ### 2.3 Update `server/openclaw_llm.py` — Tool-Use Events
 
-When OpenClaw uses a tool, forward the event to the client via data channel.
+When OpenClaw uses a tool, forward the event to the client via data channel:
 
 ```python
-# In _respond_via_openclaw, after getting the response:
-# Check if the response mentions tool usage (OpenClaw may include tool metadata)
-# This is a heuristic — exact detection depends on OpenClaw's response format.
-
-# Simple approach: check for tool-related keywords in the response
+# Simple heuristic: detect likely tool usage from user's question
 TOOL_KEYWORDS = {
     'calendar': ['calendar', 'schedule', 'meeting', 'event', 'appointment'],
     'weather': ['weather', 'temperature', 'forecast', 'rain', 'sunny'],
@@ -946,7 +881,6 @@ TOOL_KEYWORDS = {
 }
 
 def _detect_tool(self, user_text: str) -> str | None:
-    """Guess which tool might be used based on user's question."""
     lower = user_text.lower()
     for tool, keywords in TOOL_KEYWORDS.items():
         if any(kw in lower for kw in keywords):
@@ -962,42 +896,27 @@ def _detect_tool(self, user_text: str) -> str | None:
 
 Add conversation end detection to `bot.py`. After 30 seconds of silence, send `conversation_end` to the client and close the connection.
 
-The implementation depends on Pipecat's event system. Two approaches:
-
-**Approach A: Background asyncio task**
+**Recommended: Background asyncio task**
 ```python
 async def _monitor_silence(self, task, transport):
-    """Background task that checks for prolonged silence."""
     while True:
-        await asyncio.sleep(5)  # Check every 5 seconds
+        await asyncio.sleep(5)
         if self._silence_detector.check_timeout():
-            # Send goodbye via LLM
-            # Then signal conversation end
             logger.info("⏰ Conversation timeout — ending session")
-            # Queue a system message to make Buddy say goodbye
             await task.queue_frames([...])
             break
 ```
 
-**Approach B: Pipecat event handler**
-Check if Pipecat emits `UserStoppedSpeakingFrame` with timestamps, and track the gap.
-
-**Recommended:** Approach A is more reliable. Start a background task when client connects, cancel it on disconnect or new speech.
-
 ### 3.2 Echo Cancellation Verification
 
-The browser's `echoCancellation: true` should handle most cases. Add a server-side safety net:
+The browser's `echoCancellation: true` should handle most cases. Since Buddy uses Piper TTS (playing audio through the device speaker), the mic might pick up that audio. Add a server-side safety net:
 
 ```python
-# In bot.py — mute STT processing while TTS is playing
-# Pipecat's interruption handling already does this to some degree.
-# But for extra safety, track TTS state:
-
 class EchoGuard(FrameProcessor):
     """Suppresses STT results that arrive while TTS is playing.
     
-    This prevents Buddy from hearing its own voice through the speaker
-    and responding to itself.
+    Prevents Buddy from hearing its own Piper TTS output through the 
+    speaker and responding to itself.
     """
 
     def __init__(self):
@@ -1017,7 +936,6 @@ class EchoGuard(FrameProcessor):
             self._tts_playing = False
             self._tts_ended_at = time.time()
         elif isinstance(frame, TranscriptionFrame):
-            # Suppress transcriptions during TTS or shortly after
             if self._tts_playing:
                 return  # Drop frame
             if (time.time() - self._tts_ended_at) < self._guard_duration:
@@ -1026,11 +944,9 @@ class EchoGuard(FrameProcessor):
         await self.push_frame(frame, direction)
 ```
 
-**NOTE:** Check Pipecat's actual frame types for TTS start/stop. They may be named differently (`TTSAudioRawFrame`, `TTSStartFrame`, etc.). Search the installed package.
+**NOTE:** Check Pipecat's actual frame types for TTS start/stop. The `PiperTTSProcessor` from Week 1 already emits `TTSStartedFrame` and `TTSStoppedFrame`.
 
 ### 3.3 VAD Profile Switching
-
-If Pipecat supports runtime VAD parameter changes, switch between relaxed (conversation) and strict (always-on) profiles:
 
 ```python
 # In config.py:
@@ -1049,7 +965,7 @@ VAD_STRICT = {
 }
 ```
 
-Apply `VAD_CONVERSATION` when a client is connected, `VAD_STRICT` during wake-word-only mode. If runtime switching isn't supported, use the conversation profile always (it's fine for v1).
+Apply `VAD_CONVERSATION` when a client is connected, `VAD_STRICT` during wake-word-only mode.
 
 ---
 
@@ -1079,15 +995,15 @@ Apply `VAD_CONVERSATION` when a client is connected, `VAD_STRICT` during wake-wo
 
 ### Notifications
 - Go to **Focus** → create a "Buddy" focus mode
-- Block all notifications (or allow only critical ones)
-- This prevents notification sounds from triggering the mic
+- Block all notifications
+- Prevents notification sounds from triggering the mic
 
 ### General → AirPlay & Handoff
 - Disable Handoff
 
 ### Battery
 - Enable "Optimized Battery Charging"
-- Keep iPad plugged in permanently — the optimization protects the battery
+- Keep iPad plugged in permanently
 
 ## Step 2: Open Buddy
 
@@ -1113,20 +1029,25 @@ To exit: Triple-click Side Button → enter passcode → End
 - Say "Hey Buddy" again — screen wakes up
 - Pull out your iPhone, open Buddy PWA there → iPad should yield
 
+## How Audio Works
+
+All audio processing happens on your local network:
+- **STT:** Your speech is sent to Mac Mini → forwarded to whisper.cpp on Mac Studio → text comes back
+- **TTS:** Buddy's response text is converted to audio by Piper on Mac Mini → sent to iPad
+- **No cloud STT/TTS** — only the LLM (Claude) uses the internet
+
 ## Troubleshooting
 
 - **Mic not working:** Check Settings → Safari → Microphone → Allow
-- **"Hey Buddy" not triggering:** Speak clearly from within 3 meters. Check browser console for Porcupine errors.
+- **"Hey Buddy" not triggering:** Speak clearly from within 3 meters
 - **Screen going black:** Verify Auto-Lock is set to Never
 - **Can't exit Guided Access:** Triple-click Side Button, enter passcode, tap End
-- **No sound from Buddy:** Check iPad isn't in silent mode (check Settings → Sounds)
+- **No sound from Buddy:** Check iPad isn't in silent mode (Settings → Sounds)
 ```
 
 ---
 
 ## PHASE 5: Validation Checklist
-
-Run through each item. All must pass before considering Week 3 complete.
 
 ### Wake Word
 - [ ] "Hey Buddy" triggers from 1 meter
@@ -1153,7 +1074,9 @@ Run through each item. All must pass before considering Week 3 complete.
 - [ ] Two browsers can't both be active simultaneously
 - [ ] Data channel `yield` message received and processed
 
-### Audio
+### Audio (Local Pipeline)
+- [ ] whisper.cpp transcription works from iPad mic (check server logs for `[whisper]` tags)
+- [ ] Piper TTS audio plays through iPad speaker (check server logs for `[piper]` tags)
 - [ ] No echo: Buddy speaking doesn't trigger self-response
 - [ ] Background TV/music doesn't trigger false wake words (< 1 per hour)
 - [ ] Background noise doesn't trigger false STT during conversation
@@ -1183,10 +1106,13 @@ git commit -m "Week 3: Wake word, iPad home station, multi-device, audio hardeni
 - 'Hey Buddy' wake word via Picovoice Porcupine (on-device WASM)
 - Always-on mode: auto-reconnect, wake lock, ambient display
 - Multi-device management: one active device, clean handoff
-- Echo cancellation guard, conversation timeout
+- Echo cancellation guard for Piper TTS output
+- Conversation timeout detection
 - Audio feedback sounds (Web Audio API procedural)
 - Tool-use indicators on client
-- iPad kiosk setup guide"
+- iPad kiosk setup guide
+- STT: whisper.cpp on Mac Studio (unchanged)
+- TTS: Piper on Mac Mini (unchanged)"
 git push origin main
 ```
 
@@ -1194,19 +1120,19 @@ git push origin main
 
 ## KNOWN ISSUES & EDGE CASES
 
-1. **Porcupine SDK version:** The CDN URL `@picovoice/porcupine-web@3` may need updating. Check https://www.npmjs.com/package/@picovoice/porcupine-web for the latest version. The API surface (constructor, `process()` method, frame handling) may differ between v2 and v3.
+1. **Porcupine SDK version:** The CDN URL `@picovoice/porcupine-web@3` may need updating. Check https://www.npmjs.com/package/@picovoice/porcupine-web for the latest version.
 
-2. **ScriptProcessorNode deprecation:** `ScriptProcessorNode` is deprecated in favor of `AudioWorkletNode`. It still works in all browsers as of 2026. For production, migrate to AudioWorklet. For v1, it's fine.
+2. **ScriptProcessorNode deprecation:** Still works in all browsers as of 2026. For production, migrate to AudioWorklet.
 
-3. **iOS Safari Wake Lock:** Safari on iOS supports the Screen Wake Lock API as of iOS 16.4. On older iPads, the only way to prevent sleep is the Settings → Auto-Lock → Never approach.
+3. **iOS Safari Wake Lock:** Safari on iOS supports the Screen Wake Lock API as of iOS 16.4. On older iPads, use Settings → Auto-Lock → Never.
 
-4. **Mic permissions on PWA:** When opened from the home screen, the PWA may not have microphone permission cached. The user needs to grant it on first launch. Safari will remember it for subsequent launches from the same origin.
+4. **Mic permissions on PWA:** When opened from the home screen, the PWA may not have microphone permission cached. User needs to grant it on first launch.
 
-5. **Multiple conversation sessions:** The device manager prevents multiple active connections, but if two devices connect within milliseconds of each other, there could be a race condition. The simple "last writer wins" approach handles this acceptably for a single-user system.
+5. **Multiple conversation sessions:** The device manager prevents multiple active connections, but if two devices connect within milliseconds, there could be a race condition. "Last writer wins" is acceptable for single-user.
 
-6. **Porcupine access key exposure:** The Picovoice Access Key is in client-side JavaScript. This is acceptable for LAN-only use. If exposed to the internet, someone could use your key to run Porcupine (but not much else). Picovoice's free tier has generous limits.
+6. **Porcupine access key exposure:** The key is in client-side JavaScript. Acceptable for LAN-only use.
 
-7. **iPad thermal throttling:** Running WebRTC + Porcupine WASM continuously may cause thermal throttling on older iPads. Monitor battery health. If too hot, the wake word processing can be throttled (check every 64ms instead of 32ms).
+7. **iPad thermal throttling:** Running WebRTC + Porcupine WASM continuously may cause thermal throttling on older iPads. Monitor battery health.
 
 ---
 
@@ -1214,4 +1140,4 @@ git push origin main
 
 These are NOT in scope for this buildspec:
 
-- **Week 4:** Local fallback chain (Whisper.cpp STT + Piper TTS + Qwen LLM), latency optimization, voice cloning, production polish
+- **Week 4:** Cloud upgrade option (Deepgram + ElevenLabs as optional premium tier), production polish, monitoring dashboard, launchd service
