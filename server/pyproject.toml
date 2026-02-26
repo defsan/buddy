@@ -4,11 +4,14 @@ version = "0.1.0"
 description = "Voice companion — local-first Pipecat voice AI agent"
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "pipecat-ai[webrtc,anthropic,silero,runner]",
+    "pipecat-ai[anthropic,kokoro,runner,silero,webrtc]",
     "python-dotenv",
     "loguru",
     "aiohttp",
 ]
+
+[tool.setuptools]
+py-modules = ["bot", "config", "stt_whisper", "tts_piper"]
 
 [build-system]
 requires = ["setuptools"]

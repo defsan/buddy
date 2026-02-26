@@ -1,6 +1,6 @@
 """Buddy — Voice Companion Server (Local-First).
 
-Uses whisper.cpp (Mac Studio) for STT and Piper (local) for TTS.
+Uses whisper.cpp for STT, Kokoro for TTS, and Claude for the LLM.
 Only paid service is Anthropic Claude for the LLM.
 
 Run with: uv run bot.py
@@ -23,7 +23,17 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 
 logger.info("Silero VAD loaded")
 
-from pipecat.frames.frames import LLMRunFrame
+import time
+
+from pipecat.frames.frames import (
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMRunFrame,
+    TranscriptionFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -39,11 +49,46 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 
 # Local STT + TTS
 from stt_whisper import WhisperSTTProcessor
-from tts_piper import PiperTTSProcessor
+from pipecat.services.kokoro.tts import KokoroTTSService
 
 logger.info("All components loaded")
 
 import config  # Validates config on import
+
+
+class PipelineLogger(FrameProcessor):
+    """Logs key frames as they flow through the pipeline for observability."""
+
+    def __init__(self, name: str):
+        super().__init__()
+        self._name = name
+        self._llm_start: float = 0
+        self._tts_start: float = 0
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            logger.info(f"[{self._name}] transcription -> LLM: \"{frame.text}\"")
+            self._llm_start = time.monotonic()
+
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            ttfb = (time.monotonic() - self._llm_start) * 1000 if self._llm_start else 0
+            logger.info(f"[{self._name}] LLM first token: {ttfb:.0f}ms")
+
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            elapsed = (time.monotonic() - self._llm_start) * 1000 if self._llm_start else 0
+            logger.info(f"[{self._name}] LLM done: {elapsed:.0f}ms total")
+
+        elif isinstance(frame, TTSStartedFrame):
+            self._tts_start = time.monotonic()
+            logger.info(f"[{self._name}] TTS started")
+
+        elif isinstance(frame, TTSStoppedFrame):
+            elapsed = (time.monotonic() - self._tts_start) * 1000 if self._tts_start else 0
+            logger.info(f"[{self._name}] TTS done: {elapsed:.0f}ms")
+
+        await self.push_frame(frame, direction)
 
 # ── System Prompt ──────────────────────────────────────────────
 SYSTEM_PROMPT = """You are Buddy, a warm and witty voice companion. You speak out loud to Elie.
@@ -81,8 +126,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         model=config.LLM_MODEL,
     )
 
-    tts = PiperTTSProcessor(
-        model_path=config.PIPER_MODEL,
+    tts = KokoroTTSService(
+        voice_id=config.KOKORO_VOICE,
     )
 
     # ── Conversation Context ───────────────────────────────────
@@ -99,13 +144,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     # ── Pipeline ───────────────────────────────────────────────
     # Data flows left-to-right:
-    #   audio in → STT (whisper.cpp) → user context → LLM (Claude) → TTS (Piper) → audio out → assistant context
+    #   audio in → STT → context → LLM → TTS → [log] → audio out → assistant context
+    pipeline_log = PipelineLogger("pipeline")
     pipeline = Pipeline([
         transport.input(),
         stt,
         context_aggregator.user(),
         llm,
         tts,
+        pipeline_log,
         transport.output(),
         context_aggregator.assistant(),
     ])
@@ -137,7 +184,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
     logger.info(f"Buddy is ready! Open http://{config.SERVER_HOST}:{config.SERVER_PORT}/client")
     logger.info(f"  STT: whisper.cpp @ {config.WHISPER_SERVER_URL}")
-    logger.info(f"  TTS: Piper @ {config.PIPER_MODEL}")
+    logger.info(f"  TTS: Kokoro (voice={config.KOKORO_VOICE})")
     logger.info(f"  LLM: Claude ({config.LLM_MODEL})")
     await runner.run(task)
 

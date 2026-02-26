@@ -11,8 +11,8 @@ from loguru import logger
 from piper import PiperVoice
 
 from pipecat.frames.frames import (
-    AudioRawFrame,
     EndFrame,
+    TTSAudioRawFrame,
     TextFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -71,7 +71,7 @@ class PiperTTSProcessor(FrameProcessor):
             elapsed = (time.monotonic() - t0) * 1000
             logger.debug(f"Piper TTS: {elapsed:.0f}ms for: {text[:60]}...")
 
-            await self.push_frame(AudioRawFrame(
+            await self.push_frame(TTSAudioRawFrame(
                 audio=pcm_data,
                 sample_rate=self._sample_rate,
                 num_channels=1,

@@ -12,7 +12,7 @@ Everything runs locally on a single machine for development. Production target i
 
 - **STT:** whisper.cpp (local, http://127.0.0.1:8178)
 - **LLM:** Claude Sonnet 4.5 via Anthropic API (only paid service)
-- **TTS:** Piper via `piper-tts` Python package (local, ~100ms)
+- **TTS:** Kokoro-82M via Pipecat's built-in `KokoroTTSService` (local, ONNX, ~100MB model auto-downloads to `~/.cache/kokoro-onnx/`)
 - **Transport:** WebRTC via Pipecat framework
 - **VAD:** Silero VAD
 
@@ -27,20 +27,22 @@ cd ~/whisper.cpp && ./build/bin/whisper-server -m models/ggml-large-v3.bin --hos
 
 # Run the voice server (in a separate terminal)
 cd server && uv run bot.py
+# Note: Kokoro model (~100MB) auto-downloads on first run
 
 # Open client in browser
 open http://localhost:7860/client
 
 # Setup scripts (run once)
 bash scripts/install-whisper.sh   # builds whisper.cpp locally
-bash scripts/install-piper.sh     # downloads Piper voice model
 ```
 
 ## Architecture
 
 ### Pipecat Pipeline (v0.0.103)
 
-Audio frames flow through a processor chain: **Transport → VAD → STT → Context Aggregation → LLM → TTS → Transport**. Pipecat uses frame-based processing with built-in interruption handling via `UserStartedSpeakingFrame`/`UserStoppedSpeakingFrame`.
+Audio frames flow through a processor chain: **Transport → VAD → STT → Context Aggregation → LLM → TTS → PipelineLogger → Transport**. Pipecat uses frame-based processing with built-in interruption handling via `UserStartedSpeakingFrame`/`UserStoppedSpeakingFrame`.
+
+A `PipelineLogger` processor sits after TTS and logs key frame events (LLM TTFB, LLM total time, TTS duration) for observability.
 
 ### Key Pipecat API Notes (v0.0.103)
 
@@ -66,6 +68,12 @@ Audio frames flow through a processor chain: **Transport → VAD → STT → Con
 
 7. **Piper install script** — Fixed archive name from `macos_arm64` to `macos_aarch64` to match actual GitHub release asset name. Note: the binary still doesn't run on ARM64 natively; use the Python package instead.
 
+8. **TTS replaced: Piper → Kokoro-82M** — Piper produced robotic speech with unnatural pauses. Replaced with Kokoro-82M (TTS Arena benchmark winner) using Pipecat's built-in `KokoroTTSService` (`pipecat-ai[kokoro]` extra). The ONNX model auto-downloads to `~/.cache/kokoro-onnx/` on first run. Default voice is `af_bella`; configurable via `KOKORO_VOICE` env var. `tts_piper.py` kept as fallback reference.
+
+9. **`pyproject.toml` needs explicit `py-modules`** — setuptools flat-layout auto-discovery fails with multiple top-level `.py` files. Added `[tool.setuptools] py-modules = [...]` to fix the build.
+
+10. **Pipeline observability added** — `bot.py` includes a `PipelineLogger` frame processor that logs LLM TTFB, LLM total response time, and TTS duration. `stt_whisper.py` logs VAD speech start/stop, STT profiling breakdown (audio duration, WAV encode time, whisper HTTP time, total, and RTF).
+
 ## Build Specifications
 
 Implementation is organized into 4-week milestones with agent-ready BUILDSPECs:
@@ -81,15 +89,16 @@ Each BUILDSPEC has non-skippable phases (Phase 0–7) with exact file paths, cod
 
 - **Pipecat API is under active development** — import paths may vary by version; check docs if imports fail
 - **Whisper.cpp binary naming** — the server binary is `whisper-server` in `build/bin/`
-- **Piper voice model sample rate** — `amy-medium` outputs at 22050 Hz. The `PiperTTSProcessor` reads this from the model config automatically.
+- **KokoroTTSService constructor** — uses `voice_id` (not `voice`). Speed is hardcoded at 1.0x in the service. No `speed` constructor param.
+- **Kokoro voice options** — `af_bella` (female, default), `af_heart` (female), `am_adam` (male). Set via `KOKORO_VOICE` env var.
 - **iPhone requires HTTPS** for microphone access when not on localhost
 - **Whisper.cpp is batch-mode** (not streaming) — adds ~300ms latency waiting for speech end
 - **iPad echo cancellation** is critical for always-on mode; use `echoCancellation: true` in getUserMedia
 
 ## Configuration
 
-All secrets go in `server/.env` (gitignored). See `server/.env.example` for the template. Required keys: `ANTHROPIC_API_KEY`. Optional: `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `PICOVOICE_ACCESS_KEY`.
+All secrets go in `server/.env` (gitignored). See `server/.env.example` for the template. Required keys: `ANTHROPIC_API_KEY`. Optional: `KOKORO_VOICE`, `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `PICOVOICE_ACCESS_KEY`.
 
 ## Latency Budget
 
-Target end-to-end: **~700ms–1s cloud, ~600–800ms local**. Per-component: STT ~300ms (Whisper.cpp), LLM ~300ms TTFB, TTS ~100ms (Piper).
+Target end-to-end: **~700ms–1s cloud, ~600–800ms local**. Per-component: STT ~300ms (Whisper.cpp), LLM ~300ms TTFB, TTS ~100ms (Kokoro). Use pipeline logs (`[pipeline]` prefix) and STT profiling logs to measure actual latency.

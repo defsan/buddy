@@ -32,15 +32,12 @@ LLM_MODEL = os.getenv("BUDDY_LLM_MODEL", "claude-sonnet-4-5-20250929")
 # ── STT: Whisper.cpp (local) ──────────────────────────────
 WHISPER_SERVER_URL = os.getenv("WHISPER_SERVER_URL", "http://127.0.0.1:8178")
 
-# ── TTS: Piper (local, Python library) ────────────────────
+# ── TTS: Kokoro (local, ONNX — auto-downloads ~100MB on first run) ─
+KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
+
+# ── TTS: Piper (local fallback) ──────────────────────────
 _home = Path.home()
 PIPER_MODEL = os.getenv("PIPER_MODEL", str(_home / ".local/share/piper/voices/en_US-amy-medium.onnx"))
-
-if not Path(PIPER_MODEL).is_file():
-    print(f"\n❌  Piper voice model not found at: {PIPER_MODEL}")
-    print(f"    → Run: bash scripts/install-piper.sh")
-    print(f"    Or set PIPER_MODEL in {_server_dir / '.env'}\n")
-    sys.exit(1)
 
 # ── Server ───────────────────────────────────────────────
 SERVER_HOST = os.getenv("BUDDY_HOST", "0.0.0.0")

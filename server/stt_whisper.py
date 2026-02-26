@@ -44,6 +44,7 @@ class WhisperSTTProcessor(FrameProcessor):
         # Audio buffering
         self._is_speaking = False
         self._audio_buffer: list[bytes] = []
+        self._speech_start: float = 0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -56,21 +57,27 @@ class WhisperSTTProcessor(FrameProcessor):
         if isinstance(frame, UserStartedSpeakingFrame):
             self._is_speaking = True
             self._audio_buffer = []
+            self._speech_start = time.monotonic()
+            logger.info("VAD: speech started")
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._is_speaking = False
+            speech_dur = (time.monotonic() - self._speech_start) * 1000 if self._speech_start else 0
+            logger.info(f"VAD: speech ended ({speech_dur:.0f}ms)")
             await self.push_frame(frame, direction)
 
             if self._audio_buffer:
                 text = await self._transcribe()
                 if text:
-                    logger.info(f"🎤 User said: {text}")
+                    logger.info(f"STT result: \"{text}\"")
                     await self.push_frame(TranscriptionFrame(
                         text=text,
                         user_id="user",
                         timestamp=str(time.time()),
                     ))
+                else:
+                    logger.info("STT result: (empty)")
                 self._audio_buffer = []
 
         elif isinstance(frame, AudioRawFrame):
@@ -92,9 +99,12 @@ class WhisperSTTProcessor(FrameProcessor):
 
         try:
             pcm_data = b"".join(self._audio_buffer)
-            wav_bytes = self._pcm_to_wav(pcm_data, self._sample_rate)
+            audio_duration = len(pcm_data) / (self._sample_rate * 2) * 1000  # 16-bit = 2 bytes/sample
 
-            t0 = time.monotonic()
+            t_wav = time.monotonic()
+            wav_bytes = self._pcm_to_wav(pcm_data, self._sample_rate)
+            wav_ms = (time.monotonic() - t_wav) * 1000
+
             session = await self._get_session()
 
             form = aiohttp.FormData()
@@ -107,6 +117,7 @@ class WhisperSTTProcessor(FrameProcessor):
             form.add_field("language", self._language)
             form.add_field("response_format", "json")
 
+            t_http = time.monotonic()
             async with session.post(
                 f"{self._server_url}/inference",
                 data=form,
@@ -116,9 +127,16 @@ class WhisperSTTProcessor(FrameProcessor):
                     return None
 
                 result = await resp.json()
+                http_ms = (time.monotonic() - t_http) * 1000
+
                 text = result.get("text", "").strip()
-                elapsed = (time.monotonic() - t0) * 1000
-                logger.debug(f"⏱️  Whisper STT: {elapsed:.0f}ms")
+                total_ms = wav_ms + http_ms
+                rtf = total_ms / audio_duration if audio_duration > 0 else 0
+                logger.info(
+                    f"STT profiling: audio={audio_duration:.0f}ms, "
+                    f"wav_encode={wav_ms:.1f}ms, whisper={http_ms:.0f}ms, "
+                    f"total={total_ms:.0f}ms, RTF={rtf:.2f}x"
+                )
                 return text or None
 
         except asyncio.TimeoutError:
