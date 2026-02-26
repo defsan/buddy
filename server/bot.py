@@ -1,0 +1,159 @@
+"""Buddy — Voice Companion Server (Local-First).
+
+Uses whisper.cpp (Mac Studio) for STT and Piper (local) for TTS.
+Only paid service is Anthropic Claude for the LLM.
+
+Run with: uv run bot.py
+Then open http://localhost:7860/client in your browser.
+"""
+
+import os
+import sys
+
+# Ensure server directory is in path for local imports
+sys.path.insert(0, os.path.dirname(__file__))
+
+from loguru import logger
+
+print("🐾 Starting Buddy voice companion (local-first)...")
+print("⏳ Loading models...\n")
+
+logger.info("Loading Silero VAD model...")
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+
+logger.info("Silero VAD loaded")
+
+from pipecat.frames.frames import LLMRunFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.services.anthropic.llm import AnthropicLLMService
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+
+# Local STT + TTS
+from stt_whisper import WhisperSTTProcessor
+from tts_piper import PiperTTSProcessor
+
+logger.info("All components loaded")
+
+import config  # Validates config on import
+
+# ── System Prompt ──────────────────────────────────────────────
+SYSTEM_PROMPT = """You are Buddy, a warm and witty voice companion. You speak out loud to Elie.
+
+Voice rules (CRITICAL — you are being spoken aloud via TTS):
+- Keep responses to 1-3 sentences unless the user asks for detail.
+- Never use markdown, bullet points, asterisks, code blocks, or any formatting.
+- Never use emojis or special characters.
+- Use natural conversational language. Say "about twenty bucks" not "$19.99".
+- Use contractions: "I'm", "you're", "that's", "don't".
+- Don't start with "I'd be happy to help" or "Great question" — just answer.
+- You can say "hmm", "yeah", "well", "so", "anyway" — be human.
+- If you don't know something, say so briefly. Don't ramble.
+- Match the user's energy: casual question gets casual answer, serious gets serious.
+
+About Elie:
+- Engineer and product person, sharp, values directness.
+- Timezone: US Pacific (PST/PDT).
+- Prefers no fluff — get to the point.
+
+You are NOT a generic assistant. You're Buddy — a companion. Be yourself."""
+
+
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    """Configure and run the voice pipeline."""
+    logger.info("Configuring pipeline...")
+
+    # ── Services ───────────────────────────────────────────────
+    stt = WhisperSTTProcessor(
+        server_url=config.WHISPER_SERVER_URL,
+    )
+
+    llm = AnthropicLLMService(
+        api_key=config.ANTHROPIC_API_KEY,
+        model=config.LLM_MODEL,
+    )
+
+    tts = PiperTTSProcessor(
+        model_path=config.PIPER_MODEL,
+    )
+
+    # ── Conversation Context ───────────────────────────────────
+    context = LLMContext(
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}],
+    )
+
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
+
+    # ── Pipeline ───────────────────────────────────────────────
+    # Data flows left-to-right:
+    #   audio in → STT (whisper.cpp) → user context → LLM (Claude) → TTS (Piper) → audio out → assistant context
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        context_aggregator.user(),
+        llm,
+        tts,
+        transport.output(),
+        context_aggregator.assistant(),
+    ])
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
+
+    # ── Events ─────────────────────────────────────────────────
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected")
+        context.add_message({
+            "role": "system",
+            "content": "The user just connected. Greet them warmly but briefly — one sentence max. Be natural, like picking up a conversation with a friend.",
+        })
+        await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected")
+        await task.cancel()
+
+    # ── Run ─────────────────────────────────────────────────────
+    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+    logger.info(f"Buddy is ready! Open http://{config.SERVER_HOST}:{config.SERVER_PORT}/client")
+    logger.info(f"  STT: whisper.cpp @ {config.WHISPER_SERVER_URL}")
+    logger.info(f"  TTS: Piper @ {config.PIPER_MODEL}")
+    logger.info(f"  LLM: Claude ({config.LLM_MODEL})")
+    await runner.run(task)
+
+
+async def bot(runner_args: RunnerArguments):
+    """Main entry point for Pipecat's runner."""
+    transport_params = {
+        "webrtc": lambda: TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+        ),
+    }
+    transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport, runner_args)
+
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+    main()

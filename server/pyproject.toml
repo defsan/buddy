@@ -1,0 +1,15 @@
+[project]
+name = "buddy"
+version = "0.1.0"
+description = "Voice companion — local-first Pipecat voice AI agent"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "pipecat-ai[webrtc,anthropic,silero,runner]",
+    "python-dotenv",
+    "loguru",
+    "aiohttp",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
