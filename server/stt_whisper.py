@@ -137,6 +137,7 @@ class WhisperSTTProcessor(FrameProcessor):
                     f"wav_encode={wav_ms:.1f}ms, whisper={http_ms:.0f}ms, "
                     f"total={total_ms:.0f}ms, RTF={rtf:.2f}x"
                 )
+
                 return text or None
 
         except asyncio.TimeoutError:
